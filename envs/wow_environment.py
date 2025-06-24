@@ -1,98 +1,84 @@
-import logging
-import time
-import win32gui
-import win32con
-import ctypes
 import cv2
 import numpy as np
-from typing import Optional, Dict, Any
-from mss import mss
+import pyautogui
+from PIL import ImageGrab
+import os
+import logging
 
 
-class Config:
-    WOW_WINDOW_TITLE = "World of Warcraft"
-    YANDEX_GPT_API_KEY = "your_api_key_here"  # Замените на реальный ключ
-    CAPTURE_FPS = 15
-    MAX_CACHE_SIZE = 30
+class WowEnvironment:
+    def __init__(self, region=None):
+        self.region = region or (0, 0, 1920, 1080)
+        self.logger = logging.getLogger(__name__)
+        self.templates = self._load_templates()
 
-logger = logging.getLogger(__name__)
+    def _load_templates(self):
+        """Загрузка шаблонов с проверкой пути"""
+        template_dir = os.path.join(os.path.dirname(__file__), 'envs', 'templates')
+        self.logger.info(f"Ищу шаблоны в: {template_dir}")
 
-class WoWEnvironment:
-    def __init__(self):
-        self.window_handle = None
-        self.sct = None
-        self.capture_region = None
-        self.last_frame_time = 0
-        
-    def initialize(self) -> bool:
+        if not os.path.exists(template_dir):
+            self.logger.warning(f"Папка не найдена: {template_dir}")
+            os.makedirs(template_dir, exist_ok=True)
+
+        templates = {'npc': [], 'enemy': []}
+
+        # Проверяем существование файлов
+        for name in templates.keys():
+            template_path = os.path.join(template_dir, f'{name}_0.png')
+            if os.path.exists(template_path):
+                img = cv2.imread(template_path, cv2.IMREAD_COLOR)
+                if img is not None:
+                    templates[name].append(img)
+                    self.logger.info(f"Загружен шаблон: {template_path}")
+
+            # Создаем дефолтные если не найдены
+            if not templates[name]:
+                templates[name].append(self._create_default_template(name))
+                self.logger.warning(f"Создан дефолтный шаблон для {name}")
+
+        return templates
+
+    def capture_screen(self):
+        """Захват экрана с обработкой ошибок"""
         try:
-            self._set_dpi_awareness()
-            self._find_window()
-            self._setup_capture_region()
-            self._init_capture()
-            return True
+            screen = ImageGrab.grab(bbox=self.region)
+            return cv2.cvtColor(np.array(screen), cv2.COLOR_RGB2BGR)
         except Exception as e:
-            logger.error(f"Ошибка инициализации: {str(e)}")
-            self.cleanup()
-            return False
+            self.logger.error(f"Ошибка захвата: {str(e)}")
+            return np.zeros((1080, 1920, 3), dtype=np.uint8)  # Черный экран при ошибке
 
-    def _set_dpi_awareness(self):
-        try:
-            ctypes.windll.shcore.SetProcessDpiAwareness(2)
-        except (AttributeError, OSError):
-            ctypes.windll.user32.SetProcessDPIAware()
-
-    def _find_window(self):
-        def callback(hwnd, _):
-            if (win32gui.IsWindowVisible(hwnd) and 
-                Config.WOW_WINDOW_TITLE.lower() in win32gui.GetWindowText(hwnd).lower()):
-                rect = win32gui.GetWindowRect(hwnd)
-                if rect[2] - rect[0] > 100 and rect[3] - rect[1] > 100:
-                    self.window_handle = hwnd
-        
-        win32gui.EnumWindows(callback, None)
-        if not self.window_handle:
-            raise ValueError(f"Окно '{Config.WOW_WINDOW_TITLE}' не найдено")
-
-    def _setup_capture_region(self):
-        left, top, right, bottom = win32gui.GetWindowRect(self.window_handle)
-        if win32gui.IsIconic(self.window_handle):
-            win32gui.ShowWindow(self.window_handle, win32con.SW_RESTORE)
-            time.sleep(0.5)
-            left, top, right, bottom = win32gui.GetWindowRect(self.window_handle)
-        
-        self.capture_region = {
-            'left': left,
-            'top': top,
-            'width': right - left,
-            'height': bottom - top
+    def get_game_state(self):
+        """Возвращает состояние игры и кадр"""
+        frame = self.capture_screen()
+        state = {
+            'npcs': self._find_objects(frame, 'npc'),
+            'enemies': self._find_objects(frame, 'enemy'),
+            'frame': frame  # Добавляем кадр в возвращаемый словарь
         }
+        self.logger.debug(f"Обнаружено NPC: {len(state['npcs'])}, Врагов: {len(state['enemies'])}")
+        return state
 
-    def _init_capture(self):
-        self.sct = mss()
-        logger.info(f"Инициализирован захват для региона: {self.capture_region}")
+    def _find_objects(self, frame, obj_type, threshold=0.7):
+        """Поиск объектов на кадре"""
+        results = []
+        for template in self.templates.get(obj_type, []):
+            try:
+                res = cv2.matchTemplate(frame, template, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= threshold)
+                results.extend(zip(*loc[::-1]))
+            except Exception as e:
+                self.logger.error(f"Ошибка поиска {obj_type}: {str(e)}")
+        return results
 
-    def get_game_state(self) -> Dict[str, Any]:
-        frame = self.capture_frame()
-        return {
-            'resolution': f"{self.capture_region['width']}x{self.capture_region['height']}",
-            'frame': frame,
-            'timestamp': time.time()
-        }
+    def _create_default_template(self, name):
+        """Создает простые тестовые шаблоны"""
+        size = 50
+        template = np.zeros((size, size, 3), dtype=np.uint8)
 
-    def capture_frame(self) -> Optional[np.ndarray]:
-        if time.time() - self.last_frame_time < 1 / Config.CAPTURE_FPS:
-            return None
-            
-        try:
-            frame = np.array(self.sct.grab(self.capture_region))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2RGB)
-            self.last_frame_time = time.time()
-            return frame
-        except Exception as e:
-            logger.error(f"Ошибка захвата: {str(e)}")
-            return None
+        if name == 'npc':
+            cv2.circle(template, (size // 2, size // 2), size // 3, (0, 255, 255), -1)
+        elif name == 'enemy':
+            cv2.rectangle(template, (size // 4, size // 4), (3 * size // 4, 3 * size // 4), (0, 0, 255), -1)
 
-    def cleanup(self):
-        if hasattr(self, 'sct') and self.sct:
-            self.sct.close()
+        return template

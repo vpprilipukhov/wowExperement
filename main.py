@@ -1,61 +1,42 @@
-from agents.llm_provider import LLMProvider
-from agents.action_planner import ActionPlanner
-from agents.code_generator import CodeGenerator
-from envs.wow_environment import WoWEnvironment
-import logging
-import time
+from datetime import time
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from WowMovement import WowMovement
+from detector import EnemyDetector
+from PIL import ImageGrab
+import numpy as np
+import cv2
+import time
 
 
 def main():
+    detector = EnemyDetector()
+    mover = WowMovement()
+
+    print("Бот запущен. Для выхода нажмите Ctrl+C")
+
     try:
-        logger.info("Инициализация компонентов...")
+        while True:
+            # 1. Захват экрана
+            screen = np.array(ImageGrab.grab())
+            frame = cv2.cvtColor(screen, cv2.COLOR_RGB2BGR)
 
-        # Инициализация LLMProvider
-        llm_provider = LLMProvider()
+            # 2. Поиск врагов
+            enemies = detector.find_enemies(frame)
 
-        # Тестовый запрос для проверки подключения
-        try:
-            test_response = llm_provider.get_completion([
-                {"role": "user", "text": "Тестовое сообщение"}
-            ])
-            logger.info("Подключение к Yandex GPT успешно")
-        except Exception as e:
-            logger.error(f"Ошибка подключения: {str(e)}")
-            return
+            if not enemies:
+                print("Врагов не найдено")
+                time.sleep(1)
+                continue
 
-        # Инициализация остальных компонентов
-        env = WoWEnvironment()
-        planner = ActionPlanner()
-        code_generator = CodeGenerator(llm_provider)
+            # 3. Движение к первому врагу
+            target = enemies[0]
+            print(f"Найден враг на позиции: {target}")
+            mover.move_to(*target)
 
-        logger.info("Запуск основного цикла...")
-        for i in range(3):  # Ограничим цикл для теста
-            try:
-                game_state = env.get_game_state()
-                logger.info(f"Состояние игры: {game_state}")
+            time.sleep(0.5)
 
-                task_result = planner.plan_action(
-                    game_state=game_state,
-                    history=[],
-                    inventory=[],
-                    abilities=[]
-                )
-
-                if task_result["status"] == "success":
-                    logger.info(f"Сгенерировано действие: {task_result['action']}")
-                else:
-                    logger.warning(f"Ошибка планирования: {task_result['reason']}")
-
-            except Exception as e:
-                logger.error(f"Ошибка в цикле: {str(e)}")
-
-            time.sleep(1)
-
-    except Exception as e:
-        logger.critical(f"Критическая ошибка: {str(e)}")
+    except KeyboardInterrupt:
+        print("\nБот остановлен")
 
 
 if __name__ == "__main__":
