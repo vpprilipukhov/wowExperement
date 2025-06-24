@@ -9,6 +9,19 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 
+def generate_response(prompt: str) -> Dict[str, Any]:
+    try:
+        # Здесь будет реальная реализация API вызова
+        logger.info(f"Генерация ответа для промпта: {prompt[:50]}...")
+        return {
+            'text': 'Пример ответа от LLM',
+            'status': 'success'
+        }
+    except Exception as e:
+        logger.error(f"Ошибка LLM: {str(e)}")
+        return {'status': 'error'}
+
+
 class LLMProvider:
     """Класс для работы с Yandex GPT API"""
 
@@ -37,6 +50,10 @@ class LLMProvider:
         except Exception as e:
             logger.error(f"Ошибка загрузки конфигурации: {str(e)}")
             raise
+
+    def _validate_config(self):
+        if not self.api_key or self.api_key == "your_api_key_here":
+            raise ValueError("Не задан API ключ для Yandex GPT")
 
     def get_completion(self, messages: List[Dict[str, str]]) -> Dict[str, Any]:
         """
