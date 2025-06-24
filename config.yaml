@@ -1,0 +1,32 @@
+app:
+  target_fps: 15             # Частота обработки кадров
+  screen_region: [0, 0, 3440, 1440]  # Область захвата [x1, y1, x2, y2]
+
+
+yandex_cloud:
+  api_key:
+  folder_id: ""
+
+
+# config.yaml пример
+llm:
+  provider: "yandex"         # Используемый LLM провайдер
+  api_key:     # Ключ API (хранить в .env!)
+  model: "yandex gpt-lite"
+  temperature: 0.3
+  max_tokens: 2000
+  timeout: 30
+  # Обязательные параметры (выберите один вариант)
+  folder_id: ""  # ID каталога в Yandex Cloud
+  # ИЛИ
+  model_uri: ""  # Полный URI модели
+
+
+agent:
+  max_iterations: 100
+  skill_library_path: "skills.json"
+
+
+vision:
+  ui_model: ""  # Модель детекции UI
+  confidence_threshold: 0.7  # Порог уверенности детекции
