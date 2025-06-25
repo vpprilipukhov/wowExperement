@@ -1,39 +1,32 @@
-# action_planner.py - Планировщик действий с использованием LLM
+# agents/action_planner.py - Планировщик действий с исправленной обработкой истории
 import logging
 from typing import Dict, Any
 import json
 
+logger = logging.getLogger(__name__)
+
 
 class ActionPlanner:
     def __init__(self, llm_provider):
-        """
-        Инициализация планировщика действий
-        :param llm_provider: Провайдер LLM (должен иметь метод 'generate')
-        """
-        self.logger = logging.getLogger(__name__)
+        """Инициализация планировщика действий"""
         self.llm_provider = llm_provider
-        self.logger.info("ActionPlanner инициализирован")
+        logger.info("ActionPlanner инициализирован")
 
     def plan_action(self, context: Dict[str, Any]) -> Dict:
-        """
-        Планирует следующее действие на основе контекста
-        :param context: Контекст игры
-        :return: Запланированное действие
-        """
-        self.logger.debug("Начало планирования действия")
+        """Планирует следующее действие на основе контекста"""
+        logger.debug("Начало планирования действия")
 
         try:
-            # 1. Формирование промпта
             prompt = self._build_prompt(context)
-            self.logger.debug(f"Сформирован промпт: {prompt}")
+            logger.debug(f"Сформирован промпт: {prompt}")
 
-            # 2. Запрос к LLM
-            response = self._call_llm(prompt)
-            self.logger.debug(f"Ответ LLM: {response}")
+            response = self.llm_provider.generate(
+                system_message=prompt["system_message"],
+                user_message=prompt["user_message"]
+            )
 
-            # 3. Парсинг и валидация ответа
             action = self._parse_response(response)
-            self.logger.info(f"Успешно запланировано действие: {action}")
+            logger.info(f"Успешно запланировано действие: {action}")
 
             return {
                 "status": "success",
@@ -42,18 +35,14 @@ class ActionPlanner:
             }
 
         except Exception as e:
-            self.logger.error(f"Ошибка планирования: {str(e)}", exc_info=True)
+            logger.error(f"Ошибка планирования: {str(e)}", exc_info=True)
             return {
                 "status": "error",
                 "reason": str(e)
             }
 
     def _build_prompt(self, context: Dict[str, Any]) -> Dict:
-        """
-        Формирует промпт для LLM на основе контекста
-        :param context: Контекст игры
-        :return: Промпт в формате для LLM
-        """
+        """Формирует промпт для LLM с безопасной обработкой истории"""
         system_message = (
             "Ты профессиональный AI-ассистент для World of Warcraft. Ты должен:\n"
             "1. Анализировать состояние игры\n"
@@ -69,6 +58,10 @@ class ActionPlanner:
             "```"
         )
 
+        # Безопасное получение последнего действия
+        history = context.get('history', [])
+        last_action = "нет" if not history else history[-1].get('action', 'нет')
+
         user_message = (
             f"Текущее состояние:\n"
             f"- Позиция: {context.get('game_state', {}).get('position', 'неизвестно')}\n"
@@ -77,7 +70,7 @@ class ActionPlanner:
             f"- NPC: {len(context.get('game_state', {}).get('npcs', []))}\n"
             f"- Инвентарь: {len(context.get('inventory', []))} предметов\n"
             f"- Навыки: {len(context.get('abilities', [])) if context.get('abilities') else 'нет данных'}\n\n"
-            f"Последнее действие: {context.get('history', [{}])[-1].get('action', 'нет')}"
+            f"Последнее действие: {last_action}"
         )
 
         return {
@@ -85,48 +78,29 @@ class ActionPlanner:
             "user_message": user_message
         }
 
-    def _call_llm(self, prompt: Dict) -> str:
-        """
-        Вызывает LLM с заданным промптом
-        :param prompt: Промпт для LLM
-        :return: Ответ LLM
-        """
-        self.logger.debug("Вызов LLM...")
-
-        try:
-            # Используем метод 'generate' вместо 'generate_completion'
-            response = self.llm_provider.generate(
-                system_message=prompt["system_message"],
-                user_message=prompt["user_message"]
-            )
-            return response
-        except AttributeError:
-            self.logger.error("Некорректный провайдер LLM: отсутствует метод 'generate'")
-            raise ValueError("Провайдер LLM должен иметь метод 'generate'")
-
     def _parse_response(self, response: str) -> Dict:
-        """
-        Парсит ответ LLM и валидирует его
-        :param response: Ответ от LLM
-        :return: Распарсенное действие
-        """
-        self.logger.debug("Парсинг ответа LLM...")
-
+        """Парсит и валидирует ответ от LLM"""
         try:
-            # Удаляем возможные markdown-код блоки
+            # Удаление возможных markdown-блоков
             cleaned_response = response.replace("```json", "").replace("```", "").strip()
             action = json.loads(cleaned_response)
 
-            # Базовая валидация
+            # Валидация обязательных полей
             required_fields = ["action", "target", "reason"]
             for field in required_fields:
                 if field not in action:
                     raise ValueError(f"Отсутствует обязательное поле: {field}")
 
             return action
+
         except json.JSONDecodeError as e:
-            self.logger.error(f"Ошибка парсинга JSON: {e}")
+            logger.error(f"Ошибка парсинга JSON: {e}")
             raise ValueError("Некорректный формат ответа от LLM")
         except Exception as e:
-            self.logger.error(f"Ошибка валидации ответа: {e}")
+            logger.error(f"Ошибка валидации ответа: {e}")
             raise
+
+    # Метод для обратной совместимости
+    def get_llm(self):
+        """Возвращает текущий экземпляр LLM провайдера"""
+        return self.llm_provider
