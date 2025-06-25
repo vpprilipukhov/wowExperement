@@ -54,7 +54,7 @@ class TemplateCapture:
     def _save_templates(self):
         """Сохраняет все шаблоны в папку"""
         try:
-            os.makedirs('templates', exist_ok=True)
+            os.makedirs('base', exist_ok=True)
 
             for name, images in self.templates.items():
                 if not images:
@@ -62,14 +62,14 @@ class TemplateCapture:
 
                 # Сохраняем все образцы
                 for i, img in enumerate(images):
-                    cv2.imwrite(f'templates/{name}_{i}.png', img)
+                    cv2.imwrite(f'base/{name}_{i}.png', img)
 
                 # Создаем усредненный шаблон
                 avg_template = np.mean(images, axis=0).astype(np.uint8)
-                cv2.imwrite(f'templates/{name}_template.png', avg_template)
+                cv2.imwrite(f'base/{name}_template.png', avg_template)
 
-            print("💾 Все шаблоны сохранены в папку 'templates'")
-            print(os.listdir('templates'))
+            print("💾 Все шаблоны сохранены в папку 'base'")
+            print(os.listdir('base'))
 
         except Exception as e:
             print(f"❌ Ошибка сохранения: {str(e)}")

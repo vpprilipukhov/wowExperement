@@ -6,7 +6,7 @@ import os
 import logging
 
 
-class WowEnvironment:
+class WowEnvironmentTEEEEST:
     def __init__(self, region=None):
         self.region = region or (0, 0, 1920, 1080)
         self.logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ class WowEnvironment:
 
     def _load_templates(self):
         """Загрузка шаблонов с проверкой пути"""
-        template_dir = os.path.join(os.path.dirname(__file__), 'envs', 'templates')
+        template_dir = os.path.join(os.path.dirname(__file__), 'envs', 'base')
         self.logger.info(f"Ищу шаблоны в: {template_dir}")
 
         if not os.path.exists(template_dir):
