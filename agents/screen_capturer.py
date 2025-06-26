@@ -1,49 +1,55 @@
-import dxcam
-import time
+# screen_capture.py - Модуль для захвата экрана с использованием MSS
+# MSS быстрее, чем другие библиотеки захвата экрана, так как использует низкоуровневые API
+
 import numpy as np
+from mss import mss
 import cv2
-from utils.config_loader import ConfigLoader
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-class ScreenCapturer:
-    def __init__(self):
-        self.config = ConfigLoader()
-        self.camera = None
-        self.last_frame = None
-        self.frame_count = 0
-        self.start_time = time.time()
-        self.initialize_camera()
+class ScreenCapture:
+    def __init__(self, monitor=1):
+        """
+        Инициализация захвата экрана
+        :param monitor: номер монитора для захвата (по умолчанию 1)
+        """
+        self.monitor = monitor
+        self.sct = mss()
+        self.setup_monitor()
+        logger.info(f"Инициализирован захват экрана для монитора {monitor}")
 
-    def initialize_camera(self):
-        region = self.config.get('app.screen_region')
-        self.camera = dxcam.create(region=region, output_color="RGB")
-        self.camera.start(
-            target_fps=self.config.get('app.target_fps', 15),
-            video_mode=True
-        )
+    def setup_monitor(self):
+        """Определение области захвата на основе выбранного монитора"""
+        try:
+            if len(self.sct.monitors) > self.monitor:
+                self.monitor_info = self.sct.monitors[self.monitor]
+                logger.debug(f"Информация о мониторе: {self.monitor_info}")
+            else:
+                logger.warning(f"Монитор {self.monitor} не найден, используется основной")
+                self.monitor_info = self.sct.monitors[0]
+        except Exception as e:
+            logger.error(f"Ошибка при настройке монитора: {str(e)}")
+            raise
 
-    def get_frame(self):
-        raw_frame = self.camera.get_latest_frame()
-        if raw_frame is None:
-            return self.last_frame
-        rgb_frame = raw_frame[:, :, [2, 1, 0]]
-        self.last_frame = rgb_frame
-        self.update_stats()
-        return rgb_frame
+    def capture(self):
+        """
+        Захват текущего изображения экрана
+        :return: numpy array с изображением или None в случае ошибки
+        """
+        try:
+            # Захват экрана
+            sct_img = self.sct.grab(self.monitor_info)
 
-    def update_stats(self):
-        self.frame_count += 1
-        if self.frame_count % 100 == 0:
-            elapsed = time.time() - self.start_time
-            fps = self.frame_count / elapsed
-            print(f"[ScreenCapturer] FPS: {fps:.2f}")
+            # Преобразование в numpy array
+            img = np.array(sct_img)
 
+            # Конвертация из BGRA в RGB
+            img = cv2.cvtColor(img, cv2.COLOR_BGRA2RGB)
 
-if __name__ == "__main__":
-    # Тест модуля захвата
-    capturer = ScreenCapturer()
-    for _ in range(10):
-        frame = capturer.get_frame()
-        if frame is not None:
-            print(f"Frame shape: {frame.shape}")
-        time.sleep(0.1)
+            logger.debug("Экран успешно захвачен")
+            return img
+        except Exception as e:
+            logger.error(f"Ошибка при захвате экрана: {str(e)}")
+            return None
