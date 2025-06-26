@@ -1,180 +1,195 @@
-import win32gui
-import win32process
-import win32con
-import time
-import os
-from mss import mss
-import numpy as np
-import cv2
-import logging
-import psutil
-from typing import Optional, Tuple, Dict, List
+"""
+WowWindowDetector_DPI_Fixed.py - корректный захват окна с учетом DPI масштабирования.
+Теперь точно соответствует видимому размеру окна.
+"""
 
+import os
+import win32gui
+import win32ui
+import win32con
+from PIL import Image
+import logging
+import time
+import sys
+import ctypes
+
+# Настройка логирования
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('window_manager.log'),
+        logging.FileHandler('wow_detector.log'),
         logging.StreamHandler()
     ]
 )
-
+logger = logging.getLogger(__name__)
 
 class WowWindowDetector:
-    def __init__(self, screenshots_dir: str = "screenshots"):
-        """Инициализация детектора окон WoW"""
-        self.sct = mss()
-        self.screenshots_dir = screenshots_dir
+    def __init__(self):
+        self.hwnd = None
+        self.screenshots_dir = "screenshots"
         os.makedirs(self.screenshots_dir, exist_ok=True)
+        logger.info("Инициализация детектора окна WOW")
 
-        self.current_handle = None
-        self.last_scan = 0
-        self.scan_interval = 2  # Проверка активности каждые 2 секунды
-        self.wow_process_names = [
-            'wow.exe', 'wow-64.exe',
-            'wowclassic.exe', 'PandaWoW-64.exe'
-        ]
+        # Настройка DPI awareness
+        self._set_dpi_awareness()
 
-    def _get_process_info(self, hwnd: int) -> Tuple[Optional[int], Optional[str]]:
-        """Получает PID и имя процесса по handle окна"""
+    def _set_dpi_awareness(self):
+        """Устанавливаем правильный режим DPI для точных размеров."""
         try:
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            process_name = psutil.Process(pid).name() if pid else None
-            return pid, process_name
-        except Exception:
-            return None, None
+            awareness = ctypes.c_int()
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # Per monitor v2
+            ctypes.windll.shcore.GetProcessDpiAwareness(0, ctypes.byref(awareness))
+            logger.debug(f"Установлен режим DPI awareness: {awareness.value}")
+        except:
+            logger.warning("Не удалось установить DPI awareness (Windows < 8.1?)")
 
-    def _is_wow_window(self, hwnd: int) -> bool:
-        """Проверяет, является ли окно клиентом WoW"""
-        if not win32gui.IsWindowVisible(hwnd):
-            return False
+    def find_main_wow_window(self):
+        """Находит главное окно WOW с проверкой DPI."""
+        def callback(hwnd, hwnds):
+            if win32gui.IsWindowVisible(hwnd):
+                class_name = win32gui.GetClassName(hwnd)
+                if class_name == "GxWindowClass":
+                    hwnds.append(hwnd)
+            return True
 
-        pid, process_name = self._get_process_info(hwnd)
-        if not process_name:
-            return False
+        hwnds = []
+        win32gui.EnumWindows(callback, hwnds)
 
-        return process_name.lower() in self.wow_process_names
-
-    def _get_active_wow_window(self) -> Optional[int]:
-        """Находит активное окно WoW"""
-        try:
-            # Проверяем текущее активное окно
-            foreground_hwnd = win32gui.GetForegroundWindow()
-            if self._is_wow_window(foreground_hwnd):
-                return foreground_hwnd
-
-            # Если активное окно не WoW, ищем любое окно WoW
-            def enum_windows_callback(hwnd, wow_handles):
-                if self._is_wow_window(hwnd):
-                    wow_handles.append(hwnd)
-
-            wow_handles = []
-            win32gui.EnumWindows(enum_windows_callback, wow_handles)
-            return wow_handles[0] if wow_handles else None
-
-        except Exception as e:
-            logging.error(f"Ошибка поиска окна: {str(e)}")
+        if not hwnds:
+            logger.error("Не найдено ни одного окна WOW")
             return None
 
-    def is_active(self) -> bool:
-        """Проверяет, активно ли окно WoW прямо сейчас"""
-        current_time = time.time()
-        if current_time - self.last_scan < self.scan_interval:
-            return bool(self.current_handle)
+        # Выбираем окно с максимальной площадью
+        main_window = max(hwnds, key=lambda h: self._get_window_area(h))
+        logger.debug(f"Найдено окно WOW (Handle: {main_window})")
+        return main_window
 
-        self.last_scan = current_time
-        self.current_handle = self._get_active_wow_window()
-        return bool(self.current_handle)
-
-    def _get_client_region(self) -> Optional[Dict]:
-        """Получает координаты клиентской области без рамок"""
+    def _get_window_area(self, hwnd):
+        """Вычисляет площадь окна с учетом DPI."""
         try:
-            if not self.current_handle:
+            # Получаем реальные физические пиксели
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            return (right - left) * (bottom - top)
+        except:
+            return 0
+
+    def _get_real_window_size(self):
+        """Возвращает реальные размеры окна с учетом DPI."""
+        try:
+            # Получаем прямоугольник окна в физических пикселях
+            left, top, right, bottom = win32gui.GetWindowRect(self.hwnd)
+            width = right - left
+            height = bottom - top
+
+            # Корректировка для рамок окна
+            client_rect = win32gui.GetClientRect(self.hwnd)
+            border_width = (width - client_rect[2]) // 2
+            title_height = height - client_rect[3] - border_width
+
+            logger.debug(f"Реальные размеры: {width}x{height} (рамка: {border_width}, заголовок: {title_height})")
+            return width, height
+        except Exception as e:
+            logger.error(f"Ошибка получения размеров: {str(e)}")
+            return 0, 0
+
+    def capture_full_window(self):
+        """Захватывает окно с точными физическими размерами."""
+        try:
+            # Получаем реальные размеры
+            width, height = self._get_real_window_size()
+            if width == 0 or height == 0:
+                logger.error("Некорректные размеры окна")
                 return None
 
-            # Получаем размер клиентской области
-            client_rect = win32gui.GetClientRect(self.current_handle)
+            logger.debug(f"Захват окна: {width}x{height} физических пикселей")
 
-            # Конвертируем в экранные координаты
-            client_left, client_top = win32gui.ClientToScreen(
-                self.current_handle,
-                (client_rect[0], client_rect[1])
+            # Создаем контекст устройства
+            hwndDC = win32gui.GetWindowDC(self.hwnd)
+            mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+            saveDC = mfcDC.CreateCompatibleDC()
+
+            # Создаем битмап с реальными размерами
+            saveBitMap = win32ui.CreateBitmap()
+            saveBitMap.CreateCompatibleBitmap(mfcDC, width, height)
+            saveDC.SelectObject(saveBitMap)
+
+            # Выполняем захват
+            result = saveDC.BitBlt(
+                (0, 0),
+                (width, height),
+                mfcDC,
+                (0, 0),
+                win32con.SRCCOPY
             )
-            client_right, client_bottom = win32gui.ClientToScreen(
-                self.current_handle,
-                (client_rect[2], client_rect[3])
-            )
 
-            return {
-                'left': client_left,
-                'top': client_top,
-                'width': client_right - client_left,
-                'height': client_bottom - client_top
-            }
-        except Exception as e:
-            logging.error(f"Ошибка получения региона: {str(e)}")
-            return None
+            if result is None:
+                # Конвертируем в PIL Image
+                bmpinfo = saveBitMap.GetInfo()
+                bmpstr = saveBitMap.GetBitmapBits(True)
 
-    def capture_active_client_area(self) -> Optional[Tuple[np.ndarray, Dict]]:
-        """Захватывает ТОЛЬКО клиентскую область активного окна WoW"""
-        if not self.is_active():
-            logging.warning("Нельзя сделать скриншот: WoW не активно")
-            return None
+                im = Image.frombuffer(
+                    'RGB',
+                    (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                    bmpstr, 'raw', 'BGRX', 0, 1
+                )
 
-        try:
-            region = self._get_client_region()
-            if not region:
-                return None
+                # Сохраняем с проверкой размера
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                filename = f"wow_{timestamp}.png"
+                screenshot_path = os.path.join(self.screenshots_dir, filename)
+                im.save(screenshot_path)
 
-            # Захват только клиентской области
-            screenshot = self.sct.grab(region)
-            img = np.array(screenshot)
-            img_bgr = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-
-            # Сохранение скриншота
-            timestamp = int(time.time())
-            filename = os.path.join(self.screenshots_dir, f"wow_{timestamp}.jpg")
-            cv2.imwrite(filename, img_bgr)
-
-            # Метаданные
-            pid, process_name = self._get_process_info(self.current_handle)
-            metadata = {
-                'filename': filename,
-                'hwnd': self.current_handle,
-                'timestamp': timestamp,
-                'window_region': region,
-                'process_id': pid,
-                'process_name': process_name,
-                'is_active': self.is_active()
-            }
-
-            logging.info(f"Скриншот сохранён: {filename}")
-            return img_bgr, metadata
-
-        except Exception as e:
-            logging.error(f"Ошибка захвата: {str(e)}", exc_info=True)
-            return None
-
-    def run_test(self, duration: int = 30):
-        """Тест: делает скриншоты только когда WoW активно"""
-        print(f"Тест работы на {duration} секунд...")
-        end_time = time.time() + duration
-
-        while time.time() < end_time:
-            if self.is_active():
-                result = self.capture_active_client_area()
-                if result:
-                    print(f"Сделан скриншот: {result[1]['filename']}")
+                # Проверка результата
+                if os.path.exists(screenshot_path):
+                    img = Image.open(screenshot_path)
+                    logger.info(f"Скриншот сохранен: {screenshot_path} ({img.size[0]}x{img.size[1]})")
+                    return im
                 else:
-                    print("Ошибка захвата области")
+                    logger.error("Файл скриншота не был создан")
+                    return None
             else:
-                print("WoW не активно - скриншот не сделан")
+                logger.error(f"Ошибка BitBlt: {result}")
+                return None
 
-            time.sleep(1)
+        except Exception as e:
+            logger.error(f"Критическая ошибка: {str(e)}", exc_info=True)
+            return None
+        finally:
+            self._cleanup_resources(locals())
 
-        print("Тест завершен")
+    def _cleanup_resources(self, locals_dict):
+        """Безопасное освобождение ресурсов."""
+        resources = ['saveBitMap', 'saveDC', 'mfcDC', 'hwndDC']
+        for res in resources:
+            if res in locals_dict and locals_dict[res]:
+                try:
+                    if res == 'saveBitMap':
+                        win32gui.DeleteObject(locals_dict[res].GetHandle())
+                    elif res == 'hwndDC':
+                        win32gui.ReleaseDC(self.hwnd, locals_dict[res])
+                    else:
+                        locals_dict[res].DeleteDC()
+                except Exception as e:
+                    logger.warning(f"Ошибка освобождения {res}: {str(e)}")
 
+    def run(self):
+        """Основной рабочий процесс."""
+        self.hwnd = self.find_main_wow_window()
+        if not self.hwnd:
+            sys.exit(1)
+
+        screenshot = self.capture_full_window()
+        if not screenshot:
+            sys.exit(1)
+
+        # Дополнительная проверка размера
+        expected_size = self._get_real_window_size()
+        if screenshot.size[0] != expected_size[0] or screenshot.size[1] != expected_size[1]:
+            logger.warning(f"Размер скриншота {screenshot.size} не соответствует ожидаемому {expected_size}")
+
+        sys.exit(0)
 
 if __name__ == "__main__":
     detector = WowWindowDetector()
-    detector.run_test()
+    detector.run()
