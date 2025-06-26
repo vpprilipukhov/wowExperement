@@ -1,463 +1,394 @@
-import base64
-import json
 import logging
-import os
 import time
-import yaml
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-from PIL import Image
-import io
-import hashlib
-import argparse
-
 import requests
+import base64
+import re
+from PIL import Image, ImageEnhance
+import io
+import numpy as np
+import cv2
+from pathlib import Path
+import yaml
+import json
+
+from yandex_iam import YandexIAMTokenManager
 
 
 class YandexVisionProcessor:
-    """
-    Обработчик изображений через Yandex Vision API
-    Документация: https://cloud.yandex.ru/docs/vision/quickstart
-    """
-
-    def __init__(self, folder_id: str, api_key: str,
-                 default_languages: List[str] = ["en", "ru"],
-                 timeout: int = 10,
-                 max_retries: int = 3,
-                 max_image_size: int = 4 * 1024 * 1024,  # 4 МБ
-                 max_image_dimension: int = 1280):
+    def __init__(self, iam_token_manager, folder_id):
         """
-        Инициализация процессора
+        Инициализация процессора для работы с Yandex Vision API
 
-        :param folder_id: ID каталога Yandex Cloud
-        :param api_key: API-ключ сервисного аккаунта (40 символов)
-        :param default_languages: языки для распознавания текста
-        :param timeout: таймаут запроса в секундах
-        :param max_retries: максимальное количество попыток повтора
-        :param max_image_size: максимальный размер изображения в байтах
-        :param max_image_dimension: максимальный размер большей стороны изображения в пикселях
+        :param iam_token_manager: экземпляр YandexIAMTokenManager
+        :param folder_id: ID каталога в Yandex Cloud
         """
-        # Инициализация логгера
+        self.iam_token_manager = iam_token_manager
+        self.folder_id = folder_id
         self.logger = logging.getLogger("YandexVisionProcessor")
         self.logger.setLevel(logging.INFO)
-        handler = logging.StreamHandler()
-        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-        handler.setFormatter(formatter)
-        self.logger.addHandler(handler)
 
-        # Сохраняем параметры
-        self.folder_id = folder_id
-        self.api_key = api_key
-        self.default_languages = default_languages
-        self.timeout = timeout
-        self.max_retries = max_retries
-        self.max_image_size = max_image_size
-        self.max_image_dimension = max_image_dimension
+        # Настройка обработчика логов
+        if not self.logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            handler.setFormatter(formatter)
+            self.logger.addHandler(handler)
 
-        # Логируем параметры
         self.logger.info("Инициализация Yandex Vision Processor")
-        self.logger.debug(f"Folder ID: {folder_id}")
-        if api_key:
-            self.logger.debug(f"API Key: {api_key[:5]}...{api_key[-5:]}")
-        else:
-            self.logger.error("API Key is empty!")
 
-    def compress_image(self, image_bytes: bytes) -> bytes:
+    def enhance_image_for_ocr(self, image_data: bytes) -> bytes:
         """
-        Сжимает изображение, если оно слишком большое.
-        Сохраняет формат (PNG, JPEG).
-
-        :param image_bytes: исходное изображение
-        :return: сжатое изображение
+        Улучшает изображение для лучшего распознавания текста
+        - Увеличивает контраст и резкость
+        - Удаляет шумы
+        - Оптимизирует цвета
         """
         try:
-            # Определяем формат
-            img = Image.open(io.BytesIO(image_bytes))
-            format = img.format
+            # Открываем изображение
+            img = Image.open(io.BytesIO(image_data))
 
-            # Если изображение слишком большое по размеру файла или по разрешению
-            if (len(image_bytes) > self.max_image_size or
-                    max(img.size) > self.max_image_dimension):
+            # Увеличиваем контраст
+            enhancer = ImageEnhance.Contrast(img)
+            img = enhancer.enhance(2.0)
 
-                # Вычисляем новый размер
-                ratio = min(
-                    self.max_image_dimension / max(img.size),
-                    0.9 * self.max_image_size / len(image_bytes)
-                )
-                new_size = (int(img.width * ratio), int(img.height * ratio))
+            # Увеличиваем резкость
+            enhancer = ImageEnhance.Sharpness(img)
+            img = enhancer.enhance(2.0)
 
-                # Изменяем размер
-                img = img.resize(new_size, Image.LANCZOS)
+            # Конвертируем в OpenCV формат для дополнительной обработки
+            img_cv = cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
-                # Сохраняем в буфер
+            # Уменьшаем шум
+            img_cv = cv2.fastNlMeansDenoisingColored(img_cv, None, 10, 10, 7, 21)
+
+            # Преобразуем обратно в PIL
+            img = Image.fromarray(cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB))
+
+            # Сохраняем в буфер
+            buffer = io.BytesIO()
+            img.save(buffer, format="JPEG", quality=95)
+            return buffer.getvalue()
+
+        except Exception as e:
+            self.logger.error(f"Ошибка улучшения изображения: {str(e)}")
+            return image_data
+
+    def compress_image(self, image_data: bytes, max_size_mb: float = 0.9) -> bytes:
+        """
+        Сжимает изображение до приемлемого размера для Vision API
+        """
+        try:
+            # Рассчитываем максимальный размер в байтах
+            max_size_bytes = int(max_size_mb * 1024 * 1024 * 0.75)
+
+            if len(image_data) <= max_size_bytes:
+                return image_data
+
+            img = Image.open(io.BytesIO(image_data))
+
+            # Конвертируем RGBA в RGB
+            if img.mode == 'RGBA':
+                img = img.convert('RGB')
+
+            # Параметры сжатия
+            quality = 90
+            while quality >= 50:
                 buffer = io.BytesIO()
-                img.save(buffer, format=format or "PNG", optimize=True)
-                compressed_bytes = buffer.getvalue()
+                img.save(buffer, format="JPEG", quality=quality, optimize=True)
+                compressed_data = buffer.getvalue()
 
-                self.logger.info(f"Сжато изображение: {len(image_bytes)} -> {len(compressed_bytes)} байт")
-                return compressed_bytes
-            else:
-                return image_bytes
+                if len(compressed_data) <= max_size_bytes:
+                    self.logger.info(f"Изображение сжато до {len(compressed_data)} байт (quality: {quality}%)")
+                    return compressed_data
+
+                quality -= 10
+
+            return compressed_data
+
         except Exception as e:
             self.logger.error(f"Ошибка сжатия изображения: {str(e)}")
-            return image_bytes
+            return image_data
 
-    def process_image(self, image_bytes: bytes, features: List[str] = ["TEXT_DETECTION", "OBJECT_DETECTION"]) -> \
-    Optional[dict]:
+    def extract_game_state(self, response: dict) -> dict:
         """
-        Основной метод обработки изображения
+        Анализирует полный ответ Vision API и извлекает состояние игры
 
-        :param image_bytes: изображение в виде байтов
-        :param features: список запрашиваемых функций
-        :return: структурированные результаты или None при ошибке
+        :param response: полный JSON-ответ от Vision API
+        :return: словарь с состоянием игры (hp, resource)
         """
-        # Проверка входных данных
-        if not image_bytes:
-            self.logger.error("Получены пустые байты изображения")
-            return None
+        game_state = {"hp": None, "resource": None}
+
+        # Сохраняем полный ответ для анализа
+        with open("vision_response.json", "w", encoding="utf-8") as f:
+            json.dump(response, f, ensure_ascii=False, indent=2)
+
+        # Извлекаем все текстовые блоки с координатами
+        text_blocks = []
+        try:
+            if "results" in response and response["results"]:
+                for page in response["results"][0]["results"][0]["textDetection"]["pages"]:
+                    for block in page["blocks"]:
+                        for line in block["lines"]:
+                            for word in line["words"]:
+                                text_blocks.append({
+                                    "text": word["text"],
+                                    "confidence": word["confidence"],
+                                    "bounding_box": word["boundingBox"]["vertices"]
+                                })
+        except (KeyError, TypeError) as e:
+            self.logger.error(f"Ошибка разбора ответа API: {str(e)}")
+            return game_state
+
+        if not text_blocks:
+            self.logger.error("Не найдено текстовых блоков для анализа")
+            return game_state
+
+        # Анализируем текст с помощью эвристик
+        game_state = self.analyze_text_blocks(text_blocks)
+
+        return game_state
+
+    def analyze_text_blocks(self, text_blocks: list) -> dict:
+        """
+        Применяет интеллектуальные эвристики для определения HP и ресурса
+        """
+        game_state = {"hp": None, "resource": None}
+
+        # Эвристика 1: Ищем значения в формате "число/число"
+        fraction_values = []
+        for block in text_blocks:
+            if re.match(r'^\d+\s*/\s*\d+$', block["text"]):
+                fraction_values.append(block)
+
+        # Если найдено несколько значений, выбираем самые надежные
+        if fraction_values:
+            # Сортируем по достоверности и позиции на экране
+            fraction_values.sort(
+                key=lambda x: (
+                    -x["confidence"],
+                    self.calculate_screen_position_score(x["bounding_box"])
+                )
+            )
+
+            # Первое значение - вероятно HP
+            game_state["hp"] = fraction_values[0]["text"]
+
+            # Второе значение - вероятно ресурс
+            if len(fraction_values) > 1:
+                game_state["resource"] = fraction_values[1]["text"]
+
+        # Эвристика 2: Ищем ключевые слова (health, mana и т.д.)
+        if not game_state["hp"]:
+            for block in text_blocks:
+                text = block["text"].lower()
+                if "health" in text or "hp" in text:
+                    # Ищем числовое значение рядом
+                    nearby_value = self.find_nearby_value(block, text_blocks)
+                    if nearby_value:
+                        game_state["hp"] = nearby_value
+
+        if not game_state["resource"]:
+            for block in text_blocks:
+                text = block["text"].lower()
+                if "mana" in text or "energy" in text or "resource" in text:
+                    # Ищем числовое значение рядом
+                    nearby_value = self.find_nearby_value(block, text_blocks)
+                    if nearby_value:
+                        game_state["resource"] = nearby_value
+
+        # Эвристика 3: Ищем числовые значения в нижней части экрана
+        if not game_state["hp"]:
+            bottom_values = [
+                block for block in text_blocks
+                if block["text"].isdigit() and self.is_in_bottom_area(block["bounding_box"])
+            ]
+            if bottom_values:
+                # Берем самое большое число (вероятно, это HP)
+                bottom_values.sort(key=lambda x: int(x["text"]), reverse=True)
+                game_state["hp"] = bottom_values[0]["text"]
+
+        # Логируем результаты
+        if game_state["hp"]:
+            self.logger.info(f"Определено здоровье: {game_state['hp']}")
+        else:
+            self.logger.warning("Не удалось определить здоровье")
+
+        if game_state["resource"]:
+            self.logger.info(f"Определен ресурс: {game_state['resource']}")
+        else:
+            self.logger.warning("Не удалось определить ресурс")
+
+        return game_state
+
+    def calculate_screen_position_score(self, vertices: list) -> float:
+        """
+        Вычисляет оценку позиции на экране (нижняя часть экрана получает более высокий балл)
+        """
+        # Вычисляем среднюю Y-координату
+        y_coords = [v.get("y", 0) for v in vertices]
+        avg_y = sum(y_coords) / len(y_coords)
+
+        # Чем ниже на экране, тем выше оценка (от 0 до 1)
+        return avg_y / 1000  # Нормализуем предполагаемую высоту экрана
+
+    def is_in_bottom_area(self, vertices: list) -> bool:
+        """
+        Проверяет, находится ли текст в нижней трети экрана
+        """
+        y_coords = [v.get("y", 0) for v in vertices]
+        avg_y = sum(y_coords) / len(y_coords)
+        return avg_y > 600  # Предполагаем, что экран высотой около 900px
+
+    def find_nearby_value(self, keyword_block: dict, all_blocks: list, max_distance: float = 100.0) -> str:
+        """
+        Ищет числовое значение рядом с ключевым словом
+        """
+        # Вычисляем центр ключевого слова
+        k_vertices = keyword_block["bounding_box"]
+        k_x = sum(v.get("x", 0) for v in k_vertices) / len(k_vertices)
+        k_y = sum(v.get("y", 0) for v in k_vertices) / len(k_vertices)
+
+        # Ищем ближайшее числовое значение
+        closest_value = None
+        min_distance = float('inf')
+
+        for block in all_blocks:
+            if block == keyword_block:
+                continue
+
+            if re.match(r'^\d+$', block["text"]) or re.match(r'^\d+\s*/\s*\d+$', block["text"]):
+                # Вычисляем центр блока
+                b_vertices = block["bounding_box"]
+                b_x = sum(v.get("x", 0) for v in b_vertices) / len(b_vertices)
+                b_y = sum(v.get("y", 0) for v in b_vertices) / len(b_vertices)
+
+                # Вычисляем расстояние
+                distance = ((b_x - k_x) ** 2 + (b_y - k_y) ** 2) ** 0.5
+
+                if distance < min_distance and distance < max_distance:
+                    min_distance = distance
+                    closest_value = block["text"]
+
+        return closest_value
+
+    def process_image(self, image_data: bytes) -> dict:
+        """
+        Обрабатывает изображение с помощью Yandex Vision API
+
+        :param image_data: бинарные данные изображения
+        :return: словарь с результатами распознавания
+        """
+        self.logger.info(f"Обработка изображения размером {len(image_data)} байт")
+
+        # Улучшаем изображение для распознавания
+        enhanced_image = self.enhance_image_for_ocr(image_data)
 
         # Сжимаем изображение при необходимости
-        if len(image_bytes) > self.max_image_size:
-            image_bytes = self.compress_image(image_bytes)
+        compressed_image = self.compress_image(enhanced_image)
+        content = base64.b64encode(compressed_image).decode('utf-8')
 
-        size = len(image_bytes)
-        if size > self.max_image_size:
-            self.logger.warning(f"Изображение слишком большое после сжатия ({size} байт)")
-            # Все равно попробуем обработать
-
-        self.logger.info(f"Обработка изображения размером {size} байт")
-
-        try:
-            # Шаг 1: Подготовка изображения
-            encoded_image = base64.b64encode(image_bytes).decode('utf-8')
-            self.logger.debug("Изображение закодировано в base64")
-
-            # Шаг 2: Формирование запроса
-            analyze_specs = [{
-                "content": encoded_image,
-                "features": []
-            }]
-
-            # Добавляем запрошенные функции анализа
-            for feature in features:
-                feature_config = {"type": feature}
-
-                # Для текста добавляем языки
-                if feature == "TEXT_DETECTION":
-                    feature_config["text_detection_config"] = {
-                        "language_codes": self.default_languages
+        # Формируем тело запроса
+        request_body = {
+            "folderId": self.folder_id,
+            "analyzeSpecs": [{
+                "content": content,
+                "features": [{
+                    "type": "TEXT_DETECTION",
+                    "textDetectionConfig": {
+                        "languageCodes": ["*"],
+                        "model": "page"  # Используем точную модель для документов
                     }
+                }],
+                "mimeType": "image/jpeg"
+            }]
+        }
 
-                analyze_specs[0]["features"].append(feature_config)
+        # Получаем IAM-токен
+        iam_token = self.iam_token_manager.get_iam_token()
 
-            request_body = {
-                "folderId": self.folder_id,
-                "analyzeSpecs": analyze_specs
-            }
+        # Отправляем запрос
+        response = self._send_request(iam_token, request_body)
 
-            self.logger.debug(f"Отправка запроса с функциями: {features}")
+        # Анализируем полный ответ
+        game_state = self.extract_game_state(response)
 
-            # Шаг 3: Отправка запроса
-            response = self._send_request(request_body)
+        return game_state
 
-            if not response:
-                self.logger.error("Пустой ответ от API")
-                return None
-
-            self.logger.info("Успешный ответ от API Vision")
-
-            # Шаг 4: Обработка ответа
-            return self._parse_response(response)
-
-        except Exception as e:
-            self.logger.exception(f"Критическая ошибка обработки: {str(e)}")
-            return None
-
-    def _send_request(self, body: dict) -> Optional[dict]:
+    def _send_request(self, iam_token: str, request_body: dict, max_retries: int = 3) -> dict:
         """
         Отправляет запрос к Vision API с обработкой ошибок и повторами
-
-        :param body: тело запроса в формате JSON
-        :return: ответ API или None при ошибке
         """
         url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
         headers = {
-            "Authorization": f"Api-Key {self.api_key}",
+            "Authorization": f"Bearer {iam_token}",
             "Content-Type": "application/json"
         }
 
-        # Логируем тело запроса (без base64)
-        log_body = body.copy()
-        if 'analyzeSpecs' in log_body and len(log_body['analyzeSpecs']) > 0:
-            log_body['analyzeSpecs'][0]['content'] = f"[image_data:{len(log_body['analyzeSpecs'][0]['content'])}]"
-        self.logger.debug(f"Отправка запроса: {json.dumps(log_body, indent=2)}")
-
-        for attempt in range(self.max_retries):
+        for attempt in range(max_retries):
             try:
-                self.logger.debug(f"Попытка {attempt + 1}/{self.max_retries}")
-                start_time = time.time()
-
-                response = requests.post(
-                    url,
-                    headers=headers,
-                    json=body,
-                    timeout=self.timeout
-                )
-
-                latency = time.time() - start_time
-                self.logger.debug(f"Ответ за {latency:.2f} сек. Код: {response.status_code}")
-
-                # Логируем ошибки 4xx/5xx
-                if response.status_code >= 400:
-                    self.logger.error(f"Ошибка {response.status_code}: {response.reason}")
-                    # Логируем тело ответа (первые 1000 символов)
-                    self.logger.debug(f"Ответ сервера: {response.text[:1000]}")
-
+                response = requests.post(url, json=request_body, headers=headers, timeout=30)
                 response.raise_for_status()
                 return response.json()
 
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"Ошибка запроса: {str(e)}")
-                if attempt < self.max_retries - 1:
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
                     wait_time = 2 ** attempt
-                    self.logger.warning(f"Повтор через {wait_time} сек...")
+                    self.logger.warning(f"Слишком много запросов. Повтор через {wait_time} сек...")
                     time.sleep(wait_time)
                 else:
-                    self.logger.critical("Превышено количество попыток")
-                    return None
+                    self.logger.error(f"Ошибка {e.response.status_code}: {e.response.text}")
+                    raise
 
-    def _parse_response(self, response: dict) -> dict:
-        """
-        Разбирает ответ Vision API в структурированный формат
+            except (requests.exceptions.ConnectionError, requests.exceptions.Timeout) as e:
+                wait_time = 2 ** attempt
+                self.logger.warning(f"Сетевая ошибка: {str(e)}. Повтор через {wait_time} сек...")
+                time.sleep(wait_time)
 
-        :param response: сырой ответ API
-        :return: структурированные результаты
-        """
-        result = {
-            "text": "",
-            "objects": [],
-            "raw": response
-        }
+            except Exception as e:
+                self.logger.exception("Непредвиденная ошибка при отправке запроса")
+                raise
 
-        try:
-            # Извлекаем результаты первого анализа
-            if "results" not in response or not response["results"]:
-                self.logger.error("Некорректный ответ: отсутствует results")
-                return result
-
-            first_result = response["results"][0]
-            analysis_results = first_result.get("results", [])
-
-            # Обрабатываем каждый тип результата
-            for feature in analysis_results:
-                # Распознавание текста
-                if "textDetection" in feature:
-                    text_data = feature["textDetection"]
-                    pages = text_data.get("pages", [])
-
-                    for page in pages:
-                        for block in page.get("blocks", []):
-                            for line in block.get("lines", []):
-                                words = [word["text"] for word in line.get("words", [])]
-                                result["text"] += " ".join(words) + "\n"
-
-                    word_count = len(result["text"].split())
-                    self.logger.info(f"Распознано {word_count} слов")
-
-                # Обнаружение объектов
-                elif "objectDetection" in feature:
-                    objects = feature["objectDetection"].get("objects", [])
-
-                    for obj in objects:
-                        if "name" in obj and "confidence" in obj:
-                            result["objects"].append({
-                                "name": obj["name"],
-                                "confidence": obj["confidence"],
-                                "bbox": obj.get("boundingBox", {})
-                            })
-
-                    self.logger.info(f"Обнаружено {len(result['objects'])} объектов")
-
-            return result
-
-        except (KeyError, TypeError) as e:
-            self.logger.error(f"Ошибка разбора ответа: {str(e)}")
-            result["error"] = f"Response parsing error: {str(e)}"
-            return result
+        raise RuntimeError(f"Не удалось выполнить запрос после {max_retries} попыток")
 
 
-def load_config(config_path: Path = None) -> dict:
-    """Загружает конфигурацию из config.yaml"""
-    if not config_path:
-        project_root = Path(__file__).resolve().parent.parent
-        config_path = project_root / "config.yaml"
-
-    if not config_path.exists():
-        print(f"❌ Файл config.yaml не найден: {config_path}")
-        return {}
+# Пример использования
+if __name__ == "__main__":
+    # Создаем менеджер токенов
+    token_manager = YandexIAMTokenManager()
 
     try:
+        # Получаем folder_id из конфига
+        config_path = Path(__file__).parent.parent / 'config.yaml'
         with open(config_path, 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
-    except Exception as e:
-        print(f"❌ Ошибка чтения config.yaml: {str(e)}")
-        return {}
+            config = yaml.safe_load(f)
+            folder_id = config['yandex_cloud']['folder_id']
 
+        # Инициализируем процессор
+        processor = YandexVisionProcessor(
+            iam_token_manager=token_manager,
+            folder_id=folder_id
+        )
 
-def test_connection(api_key: str, folder_id: str):
-    """
-    Тестирует подключение к Yandex Vision API
-
-    :param api_key: API ключ сервисного аккаунта
-    :param folder_id: ID каталога в Yandex Cloud
-    :return: True если подключение успешно, False в противном случае
-    """
-    url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
-    headers = {
-        "Authorization": f"Api-Key {api_key}",
-        "Content-Type": "application/json"
-    }
-
-    # Минимальный валидный запрос
-    data = {
-        "folderId": folder_id,
-        "analyzeSpecs": [{
-            "content": base64.b64encode(b"test").decode('utf-8'),
-            "features": [{"type": "TEXT_DETECTION"}]
-        }]
-    }
-
-    try:
-        response = requests.post(url, headers=headers, json=data, timeout=10)
-        response.raise_for_status()
-        print("✅ Успешное подключение к Vision API!")
-        return True
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Ошибка подключения: {str(e)}")
-        if hasattr(e, 'response') and e.response:
-            print("Детали ошибки:", e.response.text[:500])
-        return False
-
-
-def test_image_processing(processor: YandexVisionProcessor, image_path: Path):
-    """
-    Тестирует обработку конкретного изображения
-
-    :param processor: инициализированный процессор
-    :param image_path: путь к изображению
-    """
-    if not image_path.exists():
-        print(f"❌ Файл не найден: {image_path}")
-        return
-
-    try:
-        with open(image_path, 'rb') as f:
+        # Загружаем тестовое изображение
+        screenshot_path = "screenshots/game_state_12345.png"
+        with open(screenshot_path, "rb") as f:
             image_data = f.read()
 
-        print(f"✅ Загружен файл: {image_path} ({len(image_data)} байт)")
-
-        # Обработка изображения
+        # Обрабатываем изображение
         result = processor.process_image(image_data)
 
-        if not result:
-            print("❌ Ошибка обработки изображения")
-            return
+        print("\nРезультаты распознавания:")
+        print(f"HP: {result.get('hp', 'N/A')}")
+        print(f"Ресурс: {result.get('resource', 'N/A')}")
 
-        # Вывод результатов
-        print("\n--- Распознанный текст ---")
-        print(result["text"][:500] + ("..." if len(result["text"]) > 500 else ""))
-
-        if result["objects"]:
-            print("\n--- Обнаруженные объекты ---")
-            for obj in result["objects"][:10]:
-                print(f"- {obj['name']} (точность: {obj['confidence']:.2f})")
-        else:
-            print("\n⚠️ Объекты не обнаружены")
-
-        print("\n✅ Обработка завершена успешно")
+        # Сохраняем улучшенное изображение для отладки
+        enhanced = processor.enhance_image_for_ocr(image_data)
+        with open("enhanced_image.jpg", "wb") as f:
+            f.write(enhanced)
+        print("Улучшенное изображение сохранено как 'enhanced_image.jpg'")
 
     except Exception as e:
-        print(f"❌ Критическая ошибка: {str(e)}")
+        print(f"\n🔥 Критическая ошибка: {str(e)}")
         import traceback
+
         traceback.print_exc()
-
-def main():
-    """Главная функция для тестирования"""
-    # Настройка логирования
-    logging.basicConfig(level=logging.INFO)
-
-    # Парсинг аргументов командной строки
-    parser = argparse.ArgumentParser(description='Yandex Vision Processor')
-    parser.add_argument('--test-connection', action='store_true', help='Test API connection only')
-    parser.add_argument('--test-image', type=str, help='Path to specific image for testing')
-    parser.add_argument('--config', type=str, help='Path to config.yaml')
-    args = parser.parse_args()
-
-    # Загрузка конфигурации
-    config_path = Path(args.config) if args.config else None
-    config = load_config(config_path)
-    if not config:
-        return
-
-    # Получение параметров
-    yandex_config = config.get('yandex_cloud', {})
-    api_key = yandex_config.get('api_key') or os.getenv('YANDEX_API_KEY')
-    folder_id = yandex_config.get('folder_id') or os.getenv('YANDEX_FOLDER_ID')
-
-    # Проверка параметров
-    if not api_key or not folder_id:
-        print("❌ Необходимо указать в config.yaml:")
-        print("yandex_cloud:")
-        print("  api_key: ваш_40_символьный_ключ")
-        print("  folder_id: ваш_id_каталога")
-        return
-
-    # Тестирование подключения
-    if args.test_connection:
-        print("\n=== Тестирование подключения к Vision API ===")
-        if test_connection(api_key, folder_id):
-            print("✅ Подключение успешно!")
-        else:
-            print("❌ Проблемы с подключением")
-        return
-
-    # Создание процессора
-    processor = YandexVisionProcessor(
-        folder_id=folder_id,
-        api_key=api_key
-    )
-
-    # Тестирование конкретного изображения
-    if args.test_image:
-        image_path = Path(args.test_image)
-        print(f"\n=== Тестирование изображения: {image_path} ===")
-        test_image_processing(processor, image_path)
-        return
-
-    # Стандартный режим: обработка последнего скриншота
-    print("\n=== Обработка последнего скриншота ===")
-
-    # Путь к скриншотам
-    project_root = Path(__file__).resolve().parent.parent
-    screenshot_dir = project_root / "screenshots"
-
-    if not screenshot_dir.exists():
-        print(f"❌ Папка со скриншотами не найдена: {screenshot_dir}")
-        return
-
-    # Поиск последнего скриншота
-    screenshots = [f for f in screenshot_dir.iterdir()
-                   if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg']]
-
-    if not screenshots:
-        print(f"❌ Нет скриншотов в {screenshot_dir}")
-        return
-
-    latest_screenshot = max(screenshots, key=lambda f: f.stat().st_mtime)
-
-    # Обработка изображения
-    test_image_processing(processor, latest_screenshot)
-
-
-if __name__ == "__main__":
-    main()
