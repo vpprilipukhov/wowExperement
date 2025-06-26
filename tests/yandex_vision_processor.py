@@ -1,302 +1,463 @@
-"""
-YandexVisionProcessor_FinalWorking.py - полностью рабочая версия
-"""
-
-import os
-import yaml
-import json
 import base64
+import json
 import logging
-import requests
+import os
+import time
+import yaml
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from PIL import Image
-from io import BytesIO
+import io
+import hashlib
+import argparse
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('vision_processor.log', encoding='utf-8'),
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
+import requests
 
-class ConfigLoader:
-    """Загрузчик конфигурации с улучшенной обработкой ошибок"""
-
-    @staticmethod
-    def load_config():
-        """Загружает и валидирует конфиг"""
-        try:
-            config_path = Path(__file__).parent.parent / "config.yaml"
-            logger.info(f"Попытка загрузить конфиг из: {config_path}")
-
-            if not config_path.exists():
-                logger.error("Файл config.yaml не найден")
-                return None
-
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config = yaml.safe_load(f)
-
-            # Проверка структуры конфига
-            if not config or 'yandex' not in config or 'vision' not in config['yandex']:
-                logger.error("Неверная структура конфига. Ожидается раздел yandex.vision")
-                return None
-
-            vision_config = config['yandex']['vision']
-
-            # Проверка обязательных полей
-            if not all(key in vision_config for key in ['oauth_token', 'folder_id']):
-                logger.error("В разделе yandex.vision отсутствуют oauth_token или folder_id")
-                return None
-
-            # Проверка значений
-            if not vision_config['oauth_token'] or not isinstance(vision_config['oauth_token'], str):
-                logger.error("oauth_token должен быть непустой строкой")
-                return None
-
-            if not vision_config['folder_id'] or not isinstance(vision_config['folder_id'], str):
-                logger.error("folder_id должен быть непустой строкой")
-                return None
-
-            # Получаем путь к скриншотам
-            screenshots_dir = config.get('screenshots', {}).get('dir', 'screenshots')
-            if not screenshots_dir or not isinstance(screenshots_dir, str):
-                screenshots_dir = 'screenshots'
-
-            return {
-                'oauth_token': vision_config['oauth_token'],
-                'folder_id': vision_config['folder_id'],
-                'screenshots_dir': screenshots_dir
-            }
-
-        except yaml.YAMLError as e:
-            logger.error(f"Ошибка парсинга YAML: {str(e)}")
-            return None
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка загрузки конфига: {str(e)}")
-            return None
 
 class YandexVisionProcessor:
-    def __init__(self, config):
-        """Инициализация с проверкой всех параметров"""
-        self.oauth_token = config['oauth_token']
-        self.folder_id = config['folder_id']
-        self.api_url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+    """
+    Обработчик изображений через Yandex Vision API
+    Документация: https://cloud.yandex.ru/docs/vision/quickstart
+    """
 
-        # Обработка пути к скриншотам
-        screenshots_dir = config.get('screenshots_dir', 'screenshots')
-        self.screenshots_dir = (Path(__file__).parent.parent / screenshots_dir).resolve()
-        self.screenshots_dir.mkdir(exist_ok=True)
+    def __init__(self, folder_id: str, api_key: str,
+                 default_languages: List[str] = ["en", "ru"],
+                 timeout: int = 10,
+                 max_retries: int = 3,
+                 max_image_size: int = 4 * 1024 * 1024,  # 4 МБ
+                 max_image_dimension: int = 1280):
+        """
+        Инициализация процессора
 
-        logger.info(f"Папка скриншотов: {self.screenshots_dir}")
-        logger.debug(f"Используется folder_id: {self.folder_id}")
+        :param folder_id: ID каталога Yandex Cloud
+        :param api_key: API-ключ сервисного аккаунта (40 символов)
+        :param default_languages: языки для распознавания текста
+        :param timeout: таймаут запроса в секундах
+        :param max_retries: максимальное количество попыток повтора
+        :param max_image_size: максимальный размер изображения в байтах
+        :param max_image_dimension: максимальный размер большей стороны изображения в пикселях
+        """
+        # Инициализация логгера
+        self.logger = logging.getLogger("YandexVisionProcessor")
+        self.logger.setLevel(logging.INFO)
+        handler = logging.StreamHandler()
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        self.logger.addHandler(handler)
 
-    def process(self):
-        """Основной рабочий цикл"""
+        # Сохраняем параметры
+        self.folder_id = folder_id
+        self.api_key = api_key
+        self.default_languages = default_languages
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.max_image_size = max_image_size
+        self.max_image_dimension = max_image_dimension
+
+        # Логируем параметры
+        self.logger.info("Инициализация Yandex Vision Processor")
+        self.logger.debug(f"Folder ID: {folder_id}")
+        if api_key:
+            self.logger.debug(f"API Key: {api_key[:5]}...{api_key[-5:]}")
+        else:
+            self.logger.error("API Key is empty!")
+
+    def compress_image(self, image_bytes: bytes) -> bytes:
+        """
+        Сжимает изображение, если оно слишком большое.
+        Сохраняет формат (PNG, JPEG).
+
+        :param image_bytes: исходное изображение
+        :return: сжатое изображение
+        """
         try:
-            # 1. Получаем скриншот
-            screenshot = self._get_latest_screenshot()
-            if not screenshot:
-                logger.warning("Не найдено ни одного скриншота")
-                return None
+            # Определяем формат
+            img = Image.open(io.BytesIO(image_bytes))
+            format = img.format
 
-            logger.info(f"Обработка скриншота: {screenshot.name}")
+            # Если изображение слишком большое по размеру файла или по разрешению
+            if (len(image_bytes) > self.max_image_size or
+                    max(img.size) > self.max_image_dimension):
 
-            # 2. Подготавливаем изображение
-            image_data = self._prepare_image(screenshot)
-            if not image_data:
-                logger.error("Не удалось подготовить изображение")
-                return None
+                # Вычисляем новый размер
+                ratio = min(
+                    self.max_image_dimension / max(img.size),
+                    0.9 * self.max_image_size / len(image_bytes)
+                )
+                new_size = (int(img.width * ratio), int(img.height * ratio))
 
-            # 3. Отправляем в API
-            api_response = self._call_vision_api(image_data)
-            if not api_response:
-                logger.error("Ошибка при вызове Vision API")
-                return None
+                # Изменяем размер
+                img = img.resize(new_size, Image.LANCZOS)
 
-            # 4. Парсим результат
-            result = self._parse_response(api_response)
+                # Сохраняем в буфер
+                buffer = io.BytesIO()
+                img.save(buffer, format=format or "PNG", optimize=True)
+                compressed_bytes = buffer.getvalue()
 
-            if not result:
-                logger.warning("Не удалось распознать HP/Mana")
-
-            return result
-
+                self.logger.info(f"Сжато изображение: {len(image_bytes)} -> {len(compressed_bytes)} байт")
+                return compressed_bytes
+            else:
+                return image_bytes
         except Exception as e:
-            logger.error(f"Критическая ошибка обработки: {str(e)}", exc_info=True)
+            self.logger.error(f"Ошибка сжатия изображения: {str(e)}")
+            return image_bytes
+
+    def process_image(self, image_bytes: bytes, features: List[str] = ["TEXT_DETECTION", "OBJECT_DETECTION"]) -> \
+    Optional[dict]:
+        """
+        Основной метод обработки изображения
+
+        :param image_bytes: изображение в виде байтов
+        :param features: список запрашиваемых функций
+        :return: структурированные результаты или None при ошибке
+        """
+        # Проверка входных данных
+        if not image_bytes:
+            self.logger.error("Получены пустые байты изображения")
             return None
 
-    def _get_latest_screenshot(self):
-        """Находит последний скриншот"""
+        # Сжимаем изображение при необходимости
+        if len(image_bytes) > self.max_image_size:
+            image_bytes = self.compress_image(image_bytes)
+
+        size = len(image_bytes)
+        if size > self.max_image_size:
+            self.logger.warning(f"Изображение слишком большое после сжатия ({size} байт)")
+            # Все равно попробуем обработать
+
+        self.logger.info(f"Обработка изображения размером {size} байт")
+
         try:
-            screenshots = list(self.screenshots_dir.glob("wow_*.png"))
-            if not screenshots:
-                logger.warning("Нет доступных скриншотов")
-                return None
+            # Шаг 1: Подготовка изображения
+            encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+            self.logger.debug("Изображение закодировано в base64")
 
-            return max(screenshots, key=lambda x: x.stat().st_mtime)
-        except Exception as e:
-            logger.error(f"Ошибка поиска скриншота: {str(e)}")
-            return None
+            # Шаг 2: Формирование запроса
+            analyze_specs = [{
+                "content": encoded_image,
+                "features": []
+            }]
 
-    def _prepare_image(self, image_path):
-        """Подготавливает изображение для API"""
-        try:
-            with Image.open(image_path) as img:
-                # Оптимизация размера
-                if img.size[0] > 1920 or img.size[1] > 1080:
-                    img.thumbnail((1920, 1080))
+            # Добавляем запрошенные функции анализа
+            for feature in features:
+                feature_config = {"type": feature}
 
-                # Конвертация в base64
-                buffer = BytesIO()
-                img.save(buffer, format="PNG")
-                return base64.b64encode(buffer.getvalue()).decode('ascii')
-        except Exception as e:
-            logger.error(f"Ошибка подготовки изображения: {str(e)}")
-            return None
+                # Для текста добавляем языки
+                if feature == "TEXT_DETECTION":
+                    feature_config["text_detection_config"] = {
+                        "language_codes": self.default_languages
+                    }
 
-    def _call_vision_api(self, image_base64):
-        """Вызывает Vision API с расширенным логированием"""
-        try:
-            headers = {
-                "Authorization": f"Bearer {self.oauth_token}",
-                "Content-Type": "application/json"
-            }
+                analyze_specs[0]["features"].append(feature_config)
 
-            body = {
+            request_body = {
                 "folderId": self.folder_id,
-                "analyzeSpecs": [{
-                    "content": image_base64,
-                    "features": [{
-                        "type": "TEXT_DETECTION",
-                        "textDetectionConfig": {
-                            "languageCodes": ["en"],
-                            "model": "page"
-                        }
-                    }]
-                }]
+                "analyzeSpecs": analyze_specs
             }
 
-            logger.info("Отправка запроса к Vision API...")
-            logger.debug(f"Размер тела запроса: {len(json.dumps(body))} байт")
+            self.logger.debug(f"Отправка запроса с функциями: {features}")
 
-            response = requests.post(
-                self.api_url,
-                headers=headers,
-                json=body,
-                timeout=15
-            )
+            # Шаг 3: Отправка запроса
+            response = self._send_request(request_body)
 
-            logger.debug(f"Статус ответа: {response.status_code}")
-            response.raise_for_status()
-
-            return response.json()
-
-        except requests.exceptions.RequestException as e:
-            error_msg = f"Ошибка API: {str(e)}"
-            if e.response:
-                error_msg += f", статус: {e.response.status_code}, ответ: {e.response.text[:200]}"
-                if e.response.status_code == 401:
-                    error_msg += "\nПроверьте правильность oauth_token и folder_id"
-            logger.error(error_msg)
-            return None
-        except Exception as e:
-            logger.error(f"Неожиданная ошибка API: {str(e)}")
-            return None
-
-    def _parse_response(self, api_response):
-        """Парсит ответ API с проверкой структуры"""
-        try:
-            blocks = api_response["results"][0]["results"][0]["textDetection"]["pages"][0]["blocks"]
-
-            result = {"hp": None, "mana": None}
-            for block in blocks:
-                text = block["lines"][0]["text"].lower()
-                if "hp" in text:
-                    result["hp"] = self._parse_resource(text)
-                elif "mana" in text:
-                    result["mana"] = self._parse_resource(text)
-
-            return result
-        except Exception as e:
-            logger.error(f"Ошибка парсинга ответа API: {str(e)}")
-            return None
-
-    def _parse_resource(self, text):
-        """Парсит значения HP/Mana"""
-        try:
-            import re
-            match = re.search(r'(\d+)\s*/\s*(\d+)', text)
-            if not match:
+            if not response:
+                self.logger.error("Пустой ответ от API")
                 return None
 
-            return {
-                "current": int(match.group(1)),
-                "max": int(match.group(2))
-            }
+            self.logger.info("Успешный ответ от API Vision")
+
+            # Шаг 4: Обработка ответа
+            return self._parse_response(response)
+
         except Exception as e:
-            logger.warning(f"Ошибка парсинга значений: {str(e)}")
+            self.logger.exception(f"Критическая ошибка обработки: {str(e)}")
             return None
 
-def main():
-    """Точка входа с подробными инструкциями"""
-    print("=== Анализатор скриншотов WOW ===")
-    print("Версия 3.0 (финальная рабочая)")
+    def _send_request(self, body: dict) -> Optional[dict]:
+        """
+        Отправляет запрос к Vision API с обработкой ошибок и повторами
+
+        :param body: тело запроса в формате JSON
+        :return: ответ API или None при ошибке
+        """
+        url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+        headers = {
+            "Authorization": f"Api-Key {self.api_key}",
+            "Content-Type": "application/json"
+        }
+
+        # Логируем тело запроса (без base64)
+        log_body = body.copy()
+        if 'analyzeSpecs' in log_body and len(log_body['analyzeSpecs']) > 0:
+            log_body['analyzeSpecs'][0]['content'] = f"[image_data:{len(log_body['analyzeSpecs'][0]['content'])}]"
+        self.logger.debug(f"Отправка запроса: {json.dumps(log_body, indent=2)}")
+
+        for attempt in range(self.max_retries):
+            try:
+                self.logger.debug(f"Попытка {attempt + 1}/{self.max_retries}")
+                start_time = time.time()
+
+                response = requests.post(
+                    url,
+                    headers=headers,
+                    json=body,
+                    timeout=self.timeout
+                )
+
+                latency = time.time() - start_time
+                self.logger.debug(f"Ответ за {latency:.2f} сек. Код: {response.status_code}")
+
+                # Логируем ошибки 4xx/5xx
+                if response.status_code >= 400:
+                    self.logger.error(f"Ошибка {response.status_code}: {response.reason}")
+                    # Логируем тело ответа (первые 1000 символов)
+                    self.logger.debug(f"Ответ сервера: {response.text[:1000]}")
+
+                response.raise_for_status()
+                return response.json()
+
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"Ошибка запроса: {str(e)}")
+                if attempt < self.max_retries - 1:
+                    wait_time = 2 ** attempt
+                    self.logger.warning(f"Повтор через {wait_time} сек...")
+                    time.sleep(wait_time)
+                else:
+                    self.logger.critical("Превышено количество попыток")
+                    return None
+
+    def _parse_response(self, response: dict) -> dict:
+        """
+        Разбирает ответ Vision API в структурированный формат
+
+        :param response: сырой ответ API
+        :return: структурированные результаты
+        """
+        result = {
+            "text": "",
+            "objects": [],
+            "raw": response
+        }
+
+        try:
+            # Извлекаем результаты первого анализа
+            if "results" not in response or not response["results"]:
+                self.logger.error("Некорректный ответ: отсутствует results")
+                return result
+
+            first_result = response["results"][0]
+            analysis_results = first_result.get("results", [])
+
+            # Обрабатываем каждый тип результата
+            for feature in analysis_results:
+                # Распознавание текста
+                if "textDetection" in feature:
+                    text_data = feature["textDetection"]
+                    pages = text_data.get("pages", [])
+
+                    for page in pages:
+                        for block in page.get("blocks", []):
+                            for line in block.get("lines", []):
+                                words = [word["text"] for word in line.get("words", [])]
+                                result["text"] += " ".join(words) + "\n"
+
+                    word_count = len(result["text"].split())
+                    self.logger.info(f"Распознано {word_count} слов")
+
+                # Обнаружение объектов
+                elif "objectDetection" in feature:
+                    objects = feature["objectDetection"].get("objects", [])
+
+                    for obj in objects:
+                        if "name" in obj and "confidence" in obj:
+                            result["objects"].append({
+                                "name": obj["name"],
+                                "confidence": obj["confidence"],
+                                "bbox": obj.get("boundingBox", {})
+                            })
+
+                    self.logger.info(f"Обнаружено {len(result['objects'])} объектов")
+
+            return result
+
+        except (KeyError, TypeError) as e:
+            self.logger.error(f"Ошибка разбора ответа: {str(e)}")
+            result["error"] = f"Response parsing error: {str(e)}"
+            return result
+
+
+def load_config(config_path: Path = None) -> dict:
+    """Загружает конфигурацию из config.yaml"""
+    if not config_path:
+        project_root = Path(__file__).resolve().parent.parent
+        config_path = project_root / "config.yaml"
+
+    if not config_path.exists():
+        print(f"❌ Файл config.yaml не найден: {config_path}")
+        return {}
 
     try:
-        # 1. Загрузка конфигурации
-        print("\n[1/4] Загрузка конфигурации...")
-        config = ConfigLoader.load_config()
-        if not config:
-            print("\nОШИБКА: Не удалось загрузить конфигурацию")
-            print("Проверьте файл config.yaml в корне проекта:")
-            print("- Наличие раздела yandex.vision")
-            print("- Наличие oauth_token и folder_id")
-            print(f"\nОжидаемый путь: {Path(__file__).parent.parent / 'config.yaml'}")
+        with open(config_path, 'r', encoding='utf-8') as f:
+            return yaml.safe_load(f)
+    except Exception as e:
+        print(f"❌ Ошибка чтения config.yaml: {str(e)}")
+        return {}
+
+
+def test_connection(api_key: str, folder_id: str):
+    """
+    Тестирует подключение к Yandex Vision API
+
+    :param api_key: API ключ сервисного аккаунта
+    :param folder_id: ID каталога в Yandex Cloud
+    :return: True если подключение успешно, False в противном случае
+    """
+    url = "https://vision.api.cloud.yandex.net/vision/v1/batchAnalyze"
+    headers = {
+        "Authorization": f"Api-Key {api_key}",
+        "Content-Type": "application/json"
+    }
+
+    # Минимальный валидный запрос
+    data = {
+        "folderId": folder_id,
+        "analyzeSpecs": [{
+            "content": base64.b64encode(b"test").decode('utf-8'),
+            "features": [{"type": "TEXT_DETECTION"}]
+        }]
+    }
+
+    try:
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+        response.raise_for_status()
+        print("✅ Успешное подключение к Vision API!")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Ошибка подключения: {str(e)}")
+        if hasattr(e, 'response') and e.response:
+            print("Детали ошибки:", e.response.text[:500])
+        return False
+
+
+def test_image_processing(processor: YandexVisionProcessor, image_path: Path):
+    """
+    Тестирует обработку конкретного изображения
+
+    :param processor: инициализированный процессор
+    :param image_path: путь к изображению
+    """
+    if not image_path.exists():
+        print(f"❌ Файл не найден: {image_path}")
+        return
+
+    try:
+        with open(image_path, 'rb') as f:
+            image_data = f.read()
+
+        print(f"✅ Загружен файл: {image_path} ({len(image_data)} байт)")
+
+        # Обработка изображения
+        result = processor.process_image(image_data)
+
+        if not result:
+            print("❌ Ошибка обработки изображения")
             return
 
-        # 2. Инициализация процессора
-        print("[2/4] Инициализация процессора...")
-        processor = YandexVisionProcessor(config)
+        # Вывод результатов
+        print("\n--- Распознанный текст ---")
+        print(result["text"][:500] + ("..." if len(result["text"]) > 500 else ""))
 
-        # 3. Обработка скриншота
-        print("[3/4] Обработка скриншота...")
-        result = processor.process()
-
-        # 4. Вывод результатов
-        print("\n[4/4] Результаты анализа:")
-        if result:
-            if result["hp"]:
-                print(f"HP: {result['hp']['current']}/{result['hp']['max']}")
-            else:
-                print("HP: не распознано")
-
-            if result["mana"]:
-                print(f"Mana: {result['mana']['current']}/{result['mana']['max']}")
-            else:
-                print("Mana: не распознано")
+        if result["objects"]:
+            print("\n--- Обнаруженные объекты ---")
+            for obj in result["objects"][:10]:
+                print(f"- {obj['name']} (точность: {obj['confidence']:.2f})")
         else:
-            print("Не удалось получить результаты. Проверьте логи.")
+            print("\n⚠️ Объекты не обнаружены")
 
-        print("\nОбработка завершена. Подробности в vision_processor.log")
+        print("\n✅ Обработка завершена успешно")
 
     except Exception as e:
-        print(f"\nКРИТИЧЕСКАЯ ОШИБКА: {str(e)}")
-        print("Пожалуйста, проверьте логи для деталей.")
-        logger.critical("Критическая ошибка в main()", exc_info=True)
+        print(f"❌ Критическая ошибка: {str(e)}")
+        import traceback
+        traceback.print_exc()
+
+def main():
+    """Главная функция для тестирования"""
+    # Настройка логирования
+    logging.basicConfig(level=logging.INFO)
+
+    # Парсинг аргументов командной строки
+    parser = argparse.ArgumentParser(description='Yandex Vision Processor')
+    parser.add_argument('--test-connection', action='store_true', help='Test API connection only')
+    parser.add_argument('--test-image', type=str, help='Path to specific image for testing')
+    parser.add_argument('--config', type=str, help='Path to config.yaml')
+    args = parser.parse_args()
+
+    # Загрузка конфигурации
+    config_path = Path(args.config) if args.config else None
+    config = load_config(config_path)
+    if not config:
+        return
+
+    # Получение параметров
+    yandex_config = config.get('yandex_cloud', {})
+    api_key = yandex_config.get('api_key') or os.getenv('YANDEX_API_KEY')
+    folder_id = yandex_config.get('folder_id') or os.getenv('YANDEX_FOLDER_ID')
+
+    # Проверка параметров
+    if not api_key or not folder_id:
+        print("❌ Необходимо указать в config.yaml:")
+        print("yandex_cloud:")
+        print("  api_key: ваш_40_символьный_ключ")
+        print("  folder_id: ваш_id_каталога")
+        return
+
+    # Тестирование подключения
+    if args.test_connection:
+        print("\n=== Тестирование подключения к Vision API ===")
+        if test_connection(api_key, folder_id):
+            print("✅ Подключение успешно!")
+        else:
+            print("❌ Проблемы с подключением")
+        return
+
+    # Создание процессора
+    processor = YandexVisionProcessor(
+        folder_id=folder_id,
+        api_key=api_key
+    )
+
+    # Тестирование конкретного изображения
+    if args.test_image:
+        image_path = Path(args.test_image)
+        print(f"\n=== Тестирование изображения: {image_path} ===")
+        test_image_processing(processor, image_path)
+        return
+
+    # Стандартный режим: обработка последнего скриншота
+    print("\n=== Обработка последнего скриншота ===")
+
+    # Путь к скриншотам
+    project_root = Path(__file__).resolve().parent.parent
+    screenshot_dir = project_root / "screenshots"
+
+    if not screenshot_dir.exists():
+        print(f"❌ Папка со скриншотами не найдена: {screenshot_dir}")
+        return
+
+    # Поиск последнего скриншота
+    screenshots = [f for f in screenshot_dir.iterdir()
+                   if f.is_file() and f.suffix.lower() in ['.png', '.jpg', '.jpeg']]
+
+    if not screenshots:
+        print(f"❌ Нет скриншотов в {screenshot_dir}")
+        return
+
+    latest_screenshot = max(screenshots, key=lambda f: f.stat().st_mtime)
+
+    # Обработка изображения
+    test_image_processing(processor, latest_screenshot)
+
 
 if __name__ == "__main__":
-    # Проверка зависимостей
-    try:
-        import yaml
-        import requests
-    except ImportError as e:
-        print(f"ОШИБКА: Не установлена зависимость - {str(e)}")
-        print("Установите необходимые пакеты:")
-        print("pip install pyyaml requests")
-        exit(1)
-
     main()
