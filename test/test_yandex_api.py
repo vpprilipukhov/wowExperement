@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 def load_config():
     """Загружает конфигурацию из config.yaml"""
-    config_path = Path(__file__).parent.parent.parent / "config.yaml"
+    config_path = Path(__file__).parent.parent / "config/config.yaml"
     try:
         with open(config_path, 'r', encoding='utf-8') as f:
             return yaml.safe_load(f)

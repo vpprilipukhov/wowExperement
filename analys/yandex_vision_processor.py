@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 from typing import Dict, Any
 
-from YandexIAMTokenManager import YandexIAMTokenManager
+from utils.yandexIAMTokenManager import YandexIAMTokenManager
 
 # Настройка логирования
 logging.basicConfig(
@@ -92,8 +92,8 @@ def main():
         processor = YandexVisionProcessor(token_manager)
 
         # Путь к тестовому изображению
-        current_dir = Path(__file__).parent
-        image_path = current_dir / "screenshots" / "game_state_12345.png"
+        current_dir = Path(__file__).parent.parent
+        image_path = current_dir / "screenshots" / "wow_20250627_031801.png"
 
         if not image_path.exists():
             logging.error(f"Тестовое изображение не найдено: {image_path}")

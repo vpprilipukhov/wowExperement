@@ -30,7 +30,7 @@ class YandexIAMTokenManager:
         try:
             # Определяем корень проекта
             project_root = Path(__file__).parent.parent
-            config_path = project_root / 'config.yaml'
+            config_path = project_root / 'config/config.yaml'
 
             logger.info(f"Загрузка конфигурации из: {config_path}")
 

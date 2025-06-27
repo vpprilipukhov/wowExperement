@@ -18,7 +18,7 @@ logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('wow_detector.log'),
+        logging.FileHandler('../logs/wow_detector.log'),
         logging.StreamHandler()
     ]
 )
@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 class WowWindowDetector:
     def __init__(self):
         self.hwnd = None
-        self.screenshots_dir = "screenshots"
+        self.screenshots_dir = "../screenshots"
         os.makedirs(self.screenshots_dir, exist_ok=True)
         logger.info("Инициализация детектора окна WOW")
 
